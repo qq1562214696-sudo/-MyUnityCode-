@@ -1,110 +1,472 @@
 bl_info = {
-    "name": "ZW_Blender: 批量FBX转换器 - 优化版",
+    "name": "ZW_Blender: 批量FBX转换器 (优化版)",
     "author": "ZW",
-    "version": (1, 1, 0),
+    "version": (2, 2, 1),
     "blender": (3, 0, 0),
     "location": "3D视图 > 右侧面板 > ZW_Blender",
-    "description": "批量转换模型文件为FBX格式，专为3ds Max优化",
+    "description": "批量转换模型文件为FBX格式 - 优化输出与日志显示",
     "category": "Import-Export",
-    "doc_url": "",
-    "tracker_url": "",
 }
 
 import bpy
 import os
-import json
-import time
 import traceback
+import shutil
+import tempfile
+import subprocess
+import time
 from pathlib import Path
-from bpy.props import StringProperty, CollectionProperty, BoolProperty
-from bpy.types import Operator, Panel, OperatorFileListElement, PropertyGroup
+from bpy.props import StringProperty, CollectionProperty, BoolProperty, IntProperty
+from bpy.types import Operator, Panel, PropertyGroup
+import atexit
 
-# 格式配置 - 简化版
-FORMAT_CONFIG = {
-    '.obj': {
-        'operator': 'import_scene.obj',
-        'type': 'import',
-    },
-    '.fbx': {
-        'operator': 'import_scene.fbx',
-        'type': 'import',
-    },
-    '.blend': {
-        'operator': 'wm.append',
-        'type': 'append',
-    },
-    '.gltf': {
-        'operator': 'import_scene.gltf',
-        'type': 'import',
-    },
-    '.glb': {
-        'operator': 'import_scene.gltf',
-        'type': 'import',
-    },
-    '.dae': {
-        'operator': 'wm.collada_import',
-        'type': 'import',
-    },
-    '.3ds': {
-        'operator': 'import_scene.autodesk_3ds',
-        'type': 'import',
-    },
-    '.ply': {
-        'operator': 'import_mesh.ply',
-        'type': 'import',
-    },
-    '.stl': {
-        'operator': 'import_mesh.stl',
-        'type': 'import',
-    },
-}
-
+# ============================================================================
+# 1. 修复的日志管理器 (使用安全的单例模式)
+# ============================================================================
 class ZW_ConversionLog:
-    """日志管理器"""
-    def __init__(self):
-        self.logs = []
-        self.start_time = time.time()
+    _instance = None
     
-    def add(self, level, message, filepath=""):
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        # 防止重新初始化
+        if getattr(self, '_initialized', False):
+            return
+            
+        self.logs = []
+        self.max_logs = 1000
+        self.callback = None
+        self.temp_file = None  # 临时文件路径
+        self._initialized = True
+    
+    def add(self, level, message, filepath="", details=""):
+        """添加日志条目"""
+        # 确保logs属性存在 (防御性编程)
+        if not hasattr(self, 'logs'):
+            self.logs = []
+        
         log_entry = {
-            'time': time.strftime("%H:%M:%S"),
             'level': level,
-            'message': message,
-            'filepath': filepath
+            'message': str(message),
+            'filepath': str(filepath),
+            'details': str(details),
+            'time': self._get_timestamp()
         }
+        
         self.logs.append(log_entry)
-        print(f"[{log_entry['time']}] {level}: {message}")
+        
+        # 限制日志数量
+        if len(self.logs) > self.max_logs:
+            self.logs = self.logs[-self.max_logs:]
+        
+        self._print_log(log_entry)
+        
+        # 回调UI更新
+        if self.callback:
+            try:
+                self.callback()
+            except:
+                pass
     
     def clear(self):
-        self.logs = []
-        self.start_time = time.time()
+        """清空所有日志"""
+        if hasattr(self, 'logs'):
+            self.logs = []
+        if self.callback:
+            try:
+                self.callback()
+            except:
+                pass
+    
+    def get_recent(self, count=10):
+        """获取最近的日志条目 - 修复方法缺失问题"""
+        if not hasattr(self, 'logs'):
+            self.logs = []
+        if not self.logs:
+            return []
+        return self.logs[-count:] if count > 0 else []
+    
+    def get_errors(self):
+        """获取所有错误日志"""
+        if not hasattr(self, 'logs'):
+            self.logs = []
+        return [log for log in self.logs if log['level'] == 'ERROR']
     
     def get_summary(self):
-        total = len([l for l in self.logs if l['level'] in ['SUCCESS', 'ERROR']])
-        success = len([l for l in self.logs if l['level'] == 'SUCCESS'])
-        errors = len([l for l in self.logs if l['level'] == 'ERROR'])
-        elapsed = time.time() - self.start_time
+        """获取统计摘要"""
+        if not hasattr(self, 'logs'):
+            self.logs = []
+        
+        total = len(self.logs)
+        success = len([log for log in self.logs if log['level'] == 'SUCCESS'])
+        errors = len([log for log in self.logs if log['level'] == 'ERROR'])
+        warnings = len([log for log in self.logs if log['level'] == 'WARNING'])
         
         return {
             'total': total,
             'success': success,
             'errors': errors,
-            'elapsed': f"{elapsed:.2f}秒"
+            'warnings': warnings
         }
+    
+    def get_formatted_summary(self):
+        """获取格式化摘要 - 修复中文乱码问题"""
+        if not hasattr(self, 'logs'):
+            self.logs = []
+        
+        success_files = []
+        failed_files = []
+        failed_details = []
+        
+        for log in self.logs:
+            if log['level'] == 'SUCCESS' and log['filepath']:
+                filename = os.path.basename(log['filepath'])
+                if filename not in success_files:
+                    success_files.append(filename)
+            elif log['level'] == 'ERROR' and log['filepath']:
+                filename = os.path.basename(log['filepath'])
+                if filename not in failed_files:
+                    failed_files.append(filename)
+                # 构建详细错误信息
+                detail = f"{filename}: {log['message']}"
+                if log['details']:
+                    # 取第一行错误详情
+                    detail_lines = log['details'].strip().split('\n')
+                    if detail_lines:
+                        detail += f" | 详情: {detail_lines[0][:150]}"
+                failed_details.append(detail)
+        
+        # 修复中文乱码：确保使用UTF-8编码构建字符串
+        summary = "批量FBX转换结果\n"
+        summary += "=" * 50 + "\n\n"
+        
+        # 成功文件列表
+        summary += "成功:\n"
+        if success_files:
+            for f in success_files:
+                summary += f"{f}\n"
+        else:
+            summary += "无\n"
+        
+        summary += "\n失败:\n"
+        if failed_files:
+            for f in failed_files:
+                summary += f"{f}\n"
+        else:
+            summary += "无\n"
+        
+        summary += "\n失败详情:\n"
+        if failed_details:
+            for i, detail in enumerate(failed_details, 1):
+                summary += f"{i}. {detail}\n"
+        else:
+            summary += "无\n"
+        
+        summary += "\n" + "=" * 50 + "\n"
+        
+        # 添加统计信息
+        stats = self.get_summary()
+        summary += f"总计: {stats['total']}, 成功: {stats['success']}, 失败: {stats['errors']}\n"
+        
+        if self.logs:
+            summary += f"开始时间: {self.logs[0]['time'] if self.logs else ''}\n"
+            summary += f"结束时间: {self.logs[-1]['time'] if self.logs else ''}\n"
+        
+        return summary
+    
+    def save_to_temp_file_and_open(self, output_dir):
+        """将日志保存到临时文件并打开，然后删除"""
+        try:
+            # 获取日志内容
+            log_content = self.get_formatted_summary()
+            
+            # 创建临时文件
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            temp_filename = f"转换日志_{timestamp}.txt"
+            temp_filepath = os.path.join(output_dir, temp_filename)
+            
+            # 保存到文件
+            with open(temp_filepath, 'w', encoding='utf-8') as f:
+                f.write(log_content)
+            
+            # 记录文件路径以便后续删除
+            self.temp_file = temp_filepath
+            
+            # 打开文件
+            self._open_file(temp_filepath)
+            
+            # 延迟删除文件（3秒后）
+            bpy.app.timers.register(lambda: self._delete_temp_file(), first_interval=3.0)
+            
+            return True, f"日志已保存到: {temp_filename}"
+            
+        except Exception as e:
+            return False, f"保存日志失败: {str(e)}"
+    
+    def _open_file(self, filepath):
+        """打开文件"""
+        try:
+            if os.name == 'nt':  # Windows
+                os.startfile(filepath)
+            elif os.name == 'posix':  # macOS/Linux
+                if shutil.which('open'):  # macOS
+                    subprocess.call(['open', filepath])
+                elif shutil.which('xdg-open'):  # Linux
+                    subprocess.call(['xdg-open', filepath])
+        except Exception as e:
+            log_manager.add('WARNING', f"无法自动打开文件: {str(e)}")
+    
+    def _delete_temp_file(self):
+        """删除临时文件"""
+        try:
+            if self.temp_file and os.path.exists(self.temp_file):
+                os.remove(self.temp_file)
+                self.temp_file = None
+        except Exception as e:
+            log_manager.add('WARNING', f"删除临时文件失败: {str(e)}")
+    
+    def _get_timestamp(self):
+        """获取时间戳"""
+        return time.strftime("%H:%M:%S")
+    
+    def _print_log(self, log_entry):
+        """打印日志到控制台"""
+        prefix = f"[{log_entry['time']}] [{log_entry['level']}]"
+        if log_entry['filepath']:
+            filename = os.path.basename(log_entry['filepath'])
+            print(f"{prefix} {filename}: {log_entry['message']}")
+            if log_entry['details'] and log_entry['level'] in ['ERROR', 'WARNING']:
+                print(f"    详情: {log_entry['details'][:200]}...")
+        else:
+            print(f"{prefix} {log_entry['message']}")
 
-# 全局日志实例
+# 全局日志实例 - 修复单例问题
 log_manager = ZW_ConversionLog()
 
+# ============================================================================
+# 2. 属性组
+# ============================================================================
 class ZW_ConversionResult(PropertyGroup):
     filepath: StringProperty(name="原始文件")
-    success: BoolProperty(name="成功")
-    message: StringProperty(name="消息")
-    output_path: StringProperty(name="输出路径")
+    success: BoolProperty(name="成功", default=False)
+    message: StringProperty(name="消息", default="")
+    output_path: StringProperty(name="输出路径", default="")
 
+# ============================================================================
+# 3. 文件处理器 (基于Blender官方推荐方案)
+# ============================================================================
+class ZW_FileProcessor:
+    
+    @staticmethod
+    def is_supported_format(filename):
+        """检查是否为支持的格式 (参考Blender官方支持列表)"""
+        supported_extensions = {
+            '.obj', '.fbx', '.blend', '.gltf', '.glb', 
+            '.dae', '.3ds', '.ply', '.stl', '.abc',
+            '.usd', '.usda', '.usdc', '.usdz', '.x3d', '.wrl'
+        }
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in supported_extensions
+    
+    @staticmethod
+    def import_file(filepath):
+        """导入文件 - 使用官方推荐方法"""
+        ext = os.path.splitext(filepath)[1].lower()
+        
+        try:
+            # 确保在对象模式
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            
+            # 清空选择
+            bpy.ops.object.select_all(action='DESELECT')
+            
+            # 记录导入前的对象数量
+            objects_before = set(bpy.data.objects)
+            
+            # 根据格式调用对应的导入器
+            if ext == '.obj':
+                # OBJ格式 - 使用推荐设置
+                bpy.ops.wm.obj_import(
+                    filepath=filepath,
+                    forward_axis='NEGATIVE_Z',
+                    up_axis='Y'
+                )
+            elif ext == '.fbx':
+                # FBX格式 - 适合动画和骨骼
+                bpy.ops.import_scene.fbx(filepath=filepath)
+            elif ext == '.blend':
+                # Blend文件使用追加方式
+                with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
+                    data_to.objects = data_from.objects
+                # 链接到当前场景
+                for obj in data_to.objects:
+                    if obj:
+                        bpy.context.collection.objects.link(obj)
+            elif ext in ['.gltf', '.glb']:
+                # glTF格式 - 适合PBR材质
+                bpy.ops.import_scene.gltf(filepath=filepath)
+            elif ext == '.dae':
+                bpy.ops.wm.collada_import(filepath=filepath)
+            elif ext == '.3ds':
+                bpy.ops.import_scene.autodesk_3ds(filepath=filepath)
+            elif ext == '.ply':
+                bpy.ops.import_mesh.ply(filepath=filepath)
+            elif ext == '.stl':
+                # STL格式 - 适合CAD和3D打印
+                bpy.ops.import_mesh.stl(filepath=filepath)
+            elif ext in ['.usd', '.usda', '.usdc', '.usdz']:
+                bpy.ops.wm.usd_import(filepath=filepath)
+            elif ext == '.abc':
+                # Alembic格式 - 适合复杂场景数据
+                bpy.ops.wm.alembic_import(filepath=filepath)
+            else:
+                return False, f"不支持的格式: {ext}"
+            
+            # 检查导入的对象
+            objects_after = set(bpy.data.objects)
+            imported_objects = objects_after - objects_before
+            
+            if imported_objects:
+                return True, f"导入成功: {len(imported_objects)}个对象"
+            else:
+                return False, "没有对象被导入"
+                
+        except Exception as e:
+            error_details = traceback.format_exc()
+            log_manager.add('ERROR', f"导入失败: {str(e)}", filepath, error_details)
+            return False, f"导入异常: {str(e)}"
+    
+    @staticmethod
+    def export_to_fbx(output_path, use_selection=True):
+        """导出为FBX - 使用稳定设置"""
+        try:
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # 如果没有选中对象，选择所有
+            if not bpy.context.selected_objects and not use_selection:
+                bpy.ops.object.select_all(action='SELECT')
+            
+            # 备份当前选择和活动对象
+            original_selection = list(bpy.context.selected_objects)
+            original_active = bpy.context.view_layer.objects.active
+            
+            # FBX导出设置 - 使用官方推荐参数
+            # FBX格式最适合导出带有骨骼和动画的对象到其他3D软件
+            export_settings = {
+                'filepath': output_path,
+                'use_selection': use_selection,
+                'object_types': {'MESH', 'ARMATURE', 'EMPTY', 'OTHER'},
+                'use_mesh_modifiers': True,
+                'mesh_smooth_type': 'FACE',
+                'use_mesh_edges': False,
+                'use_tspace': False,
+                'use_custom_props': False,
+                'add_leaf_bones': False,
+                'primary_bone_axis': 'Y',
+                'secondary_bone_axis': 'X',
+                'use_armature_deform_only': False,
+                'armature_nodetype': 'NULL',
+                'bake_anim_use_all_bones': True,
+                'bake_anim_use_nla_strips': True,
+                'bake_anim_use_all_actions': True,
+                'bake_anim_step': 1.0,
+                'bake_anim_simplify_factor': 1.0,
+                'path_mode': 'AUTO',
+                'embed_textures': False,
+                'batch_mode': 'OFF',
+                'use_batch_own_dir': True,
+                'use_metadata': True,
+                'axis_forward': '-Z',
+                'axis_up': 'Y'
+            }
+            
+            # 执行导出
+            bpy.ops.export_scene.fbx(**export_settings)
+            
+            # 恢复选择
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in original_selection:
+                obj.select_set(True)
+            if original_active:
+                bpy.context.view_layer.objects.active = original_active
+            
+            return True, "FBX导出成功"
+            
+        except Exception as e:
+            error_details = traceback.format_exc()
+            log_manager.add('ERROR', f"FBX导出失败: {str(e)}", output_path, error_details)
+            return False, f"FBX导出失败: {str(e)}"
+
+# ============================================================================
+# 4. 场景管理器
+# ============================================================================
+class ZW_SceneManager:
+    
+    @staticmethod
+    def create_temp_scene():
+        """创建临时场景用于转换"""
+        original_scene = bpy.context.scene
+        
+        # 创建新场景
+        temp_scene = bpy.data.scenes.new(name="Temp_Conversion_Scene")
+        
+        # 复制设置
+        temp_scene.render.engine = original_scene.render.engine
+        temp_scene.unit_settings.system = original_scene.unit_settings.system
+        
+        # 切换到新场景
+        bpy.context.window.scene = temp_scene
+        
+        return original_scene, temp_scene
+    
+    @staticmethod
+    def cleanup_temp_scene(temp_scene, original_scene):
+        """清理临时场景"""
+        try:
+            # 删除所有对象
+            if temp_scene:
+                for obj in list(temp_scene.objects):
+                    bpy.data.objects.remove(obj, do_unlink=True)
+            
+            # 删除孤立数据
+            ZW_SceneManager._clean_orphan_data()
+            
+            # 删除临时场景
+            if temp_scene and temp_scene.name in bpy.data.scenes:
+                bpy.data.scenes.remove(temp_scene)
+            
+            # 切换回原场景
+            if original_scene:
+                bpy.context.window.scene = original_scene
+                
+        except Exception as e:
+            log_manager.add('WARNING', f"清理场景时出错: {str(e)}")
+    
+    @staticmethod
+    def _clean_orphan_data():
+        """清理孤立的数据块"""
+        for block_type in [bpy.data.meshes, bpy.data.materials, bpy.data.images]:
+            for item in block_type:
+                if item.users == 0:
+                    try:
+                        block_type.remove(item)
+                    except:
+                        pass
+
+# ============================================================================
+# 5. 操作符
+# ============================================================================
 class ZW_OT_batch_fbx_converter(Operator):
-    """批量转换模型文件为FBX格式 - 优化版"""
+    """批量转换模型文件为FBX格式"""
     bl_idname = "zw.batch_fbx_converter"
     bl_label = "批量转换到FBX"
+    bl_description = "批量转换文件夹中的所有模型文件为FBX格式"
     bl_options = {'REGISTER', 'UNDO'}
     
     directory: StringProperty(
@@ -116,16 +478,18 @@ class ZW_OT_batch_fbx_converter(Operator):
     )
     
     def execute(self, context):
-        if not self.directory:
-            self.report({'ERROR'}, "请选择文件夹")
+        if not self.directory or not os.path.isdir(self.directory):
+            self.report({'ERROR'}, "请选择有效的文件夹")
             return {'CANCELLED'}
         
-        # 清空日志
+        # 清空日志和结果
         log_manager.clear()
+        context.scene.zw_conversion_results.clear()
+        
         log_manager.add('INFO', f"开始处理文件夹: {self.directory}")
         
-        # 获取所有要处理的文件
-        file_list = self.get_files_to_process()
+        # 获取所有文件
+        file_list = self._get_files_to_process()
         
         if not file_list:
             log_manager.add('WARNING', "没有找到支持的模型文件")
@@ -134,17 +498,14 @@ class ZW_OT_batch_fbx_converter(Operator):
         
         log_manager.add('INFO', f"找到 {len(file_list)} 个文件需要处理")
         
-        # 初始化结果记录
-        context.scene.zw_conversion_results.clear()
-        
         success_count = 0
         fail_count = 0
         
-        for i, (input_path, rel_path) in enumerate(file_list):
-            log_manager.add('INFO', f"处理文件 {i+1}/{len(file_list)}: {os.path.basename(input_path)}")
+        # 处理每个文件
+        for i, input_path in enumerate(file_list):
+            log_manager.add('INFO', f"处理文件 {i+1}/{len(file_list)}", input_path)
             
-            # 转换单个文件
-            result = self.convert_single_file(context, input_path, rel_path, i)
+            result = self._convert_single_file(input_path, i)
             
             # 记录结果
             result_item = context.scene.zw_conversion_results.add()
@@ -155,305 +516,185 @@ class ZW_OT_batch_fbx_converter(Operator):
             
             if result['success']:
                 success_count += 1
-                log_manager.add('SUCCESS', f"转换成功: {os.path.basename(input_path)}")
+                log_manager.add('SUCCESS', result['message'], input_path)
             else:
                 fail_count += 1
-                log_manager.add('ERROR', f"转换失败: {os.path.basename(input_path)} - {result['message']}")
+                log_manager.add('ERROR', result['message'], input_path, result.get('details', ''))
+            
+            # 更新UI
+            self._update_ui(context)
         
         # 显示总结
-        summary = log_manager.get_summary()
-        log_manager.add('INFO', f"转换完成! 总共: {summary['total']}, 成功: {summary['success']}, 失败: {summary['errors']}, 耗时: {summary['elapsed']}")
+        summary_msg = f"转换完成! 成功: {success_count}, 失败: {fail_count}, 总计: {len(file_list)}"
+        log_manager.add('INFO', summary_msg)
+        self.report({'INFO'}, summary_msg)
         
-        # 显示输出目录
-        output_dirs = set()
-        for item in context.scene.zw_conversion_results:
-            if item.success and item.output_path:
-                output_dirs.add(os.path.dirname(item.output_path))
+        # 保存输出目录到场景属性
+        context.scene.zw_export_folder = os.path.join(self.directory, "导出FBX")
         
-        for dir_path in output_dirs:
-            log_manager.add('INFO', f"输出到: {dir_path}")
-        
-        self.report({'INFO'}, f"转换完成: {success_count} 成功, {fail_count} 失败")
         return {'FINISHED'}
     
-    def get_files_to_process(self):
-        """获取文件夹中所有支持的模型文件"""
+    def _get_files_to_process(self):
+        """获取所有需要处理的文件"""
         file_list = []
         
-        if not os.path.isdir(self.directory):
-            return []
-        
-        # 递归获取所有文件
         for root, dirs, files in os.walk(self.directory):
+            # 跳过输出文件夹（修复：正确处理中文文件夹名）
+            dirs[:] = [d for d in dirs if "导出FBX" not in d and "Exported_FBX" not in d]
+            
             for filename in files:
-                if self.is_supported_format(filename):
+                if ZW_FileProcessor.is_supported_format(filename):
                     full_path = os.path.join(root, filename)
-                    rel_path = os.path.relpath(full_path, self.directory)
-                    file_list.append((full_path, rel_path))
+                    file_list.append(full_path)
         
-        # 按文件名排序，便于跟踪进度
-        file_list.sort(key=lambda x: x[0])
-        
-        return file_list
+        return sorted(file_list, key=lambda x: x.lower())
     
-    def is_supported_format(self, filename):
-        """检查是否为支持的格式"""
-        ext = os.path.splitext(filename)[1].lower()
-        return ext in FORMAT_CONFIG
-    
-    def convert_single_file(self, context, input_path, rel_path, index):
+    def _convert_single_file(self, input_path, index):
         """转换单个文件"""
         try:
-            log_manager.add('INFO', f"开始转换: {os.path.basename(input_path)}", input_path)
+            log_manager.add('DEBUG', f"开始转换: {os.path.basename(input_path)}", input_path)
             
-            # 保存当前场景
-            original_scene = context.scene
+            # 创建临时场景
+            original_scene, temp_scene = ZW_SceneManager.create_temp_scene()
             
-            # 创建新场景用于导入
-            temp_scene = bpy.data.scenes.new(name=f"Temp_Conv_{index}")
-            context.window.scene = temp_scene
-            
-            # 设置场景单位（3ds Max兼容）
-            temp_scene.unit_settings.system = 'METRIC'
-            temp_scene.unit_settings.scale_length = 1.0
-            
-            # 清空新场景
-            self.clean_scene(temp_scene)
-            
-            # 尝试导入
-            import_success = self.import_file(input_path)
+            # 导入文件
+            import_success, import_message = ZW_FileProcessor.import_file(input_path)
             
             if not import_success:
-                self.cleanup_temp_scene(temp_scene, original_scene)
-                return {'success': False, 'message': '导入失败'}
+                ZW_SceneManager.cleanup_temp_scene(temp_scene, original_scene)
+                return {
+                    'success': False,
+                    'message': f"导入失败: {import_message}",
+                    'details': import_message
+                }
             
-            # 检查是否有导入的对象
+            # 检查是否有对象
             if not temp_scene.objects:
-                self.cleanup_temp_scene(temp_scene, original_scene)
-                return {'success': False, 'message': '导入后场景为空'}
+                ZW_SceneManager.cleanup_temp_scene(temp_scene, original_scene)
+                return {
+                    'success': False,
+                    'message': "导入后没有找到任何对象"
+                }
             
-            # 准备输出路径
-            output_path = self.get_output_path(input_path, rel_path)
+            # 生成输出路径（修改：全部放在同一文件夹）
+            output_path = self._get_output_path(input_path, index)
             
-            # 导出为FBX
-            export_success = self.export_to_fbx(temp_scene, output_path, input_path)
+            # 导出FBX
+            export_success, export_message = ZW_FileProcessor.export_to_fbx(output_path, use_selection=False)
             
             # 清理
-            self.cleanup_temp_scene(temp_scene, original_scene)
+            ZW_SceneManager.cleanup_temp_scene(temp_scene, original_scene)
             
             if export_success:
                 return {
-                    'success': True, 
-                    'message': '转换成功',
+                    'success': True,
+                    'message': "转换成功",
                     'output_path': output_path
                 }
             else:
-                return {'success': False, 'message': '导出失败'}
+                return {
+                    'success': False,
+                    'message': f"导出失败: {export_message}",
+                    'details': export_message
+                }
             
         except Exception as e:
-            error_msg = str(e)
-            log_manager.add('ERROR', f"转换异常: {error_msg}", input_path)
+            error_details = traceback.format_exc()
+            log_manager.add('ERROR', f"转换异常: {str(e)}", input_path, error_details)
             
-            # 确保恢复原场景
-            try:
-                context.window.scene = original_scene
-            except:
-                pass
-            
-            return {'success': False, 'message': f'异常: {error_msg}'}
+            return {
+                'success': False,
+                'message': f"转换异常: {str(e)}",
+                'details': error_details
+            }
     
-    def import_file(self, filepath):
-        """导入文件"""
-        ext = os.path.splitext(filepath)[1].lower()
-        
-        if ext not in FORMAT_CONFIG:
-            return False
-        
-        try:
-            if ext == '.obj':
-                bpy.ops.import_scene.obj(
-                    filepath=filepath,
-                    use_split_objects=True,
-                    use_split_groups=True,
-                    use_image_search=True
-                )
-                
-            elif ext == '.fbx':
-                bpy.ops.import_scene.fbx(filepath=filepath)
-                
-            elif ext == '.blend':
-                # 只导入网格、骨架和空物体
-                with bpy.data.libraries.load(filepath, link=False) as (data_from, data_to):
-                    data_to.objects = [name for name in data_from.objects if name]
-                
-                # 链接到场景
-                for obj in data_to.objects:
-                    if obj and obj.type in {'MESH', 'ARMATURE', 'EMPTY'}:
-                        bpy.context.collection.objects.link(obj)
-                
-            elif ext in ['.gltf', '.glb']:
-                bpy.ops.import_scene.gltf(filepath=filepath)
-                
-            elif ext == '.dae':
-                bpy.ops.wm.collada_import(filepath=filepath)
-                
-            elif ext == '.3ds':
-                bpy.ops.import_scene.autodesk_3ds(filepath=filepath)
-                
-            elif ext == '.ply':
-                bpy.ops.import_mesh.ply(filepath=filepath)
-                
-            elif ext == '.stl':
-                bpy.ops.import_mesh.stl(filepath=filepath)
-                
-            else:
-                return False
-            
-            return True
-            
-        except Exception as e:
-            log_manager.add('ERROR', f"导入失败: {str(e)[:100]}", filepath)
-            return False
-    
-    def export_to_fbx(self, scene, output_path, source_path):
-        """导出为FBX（3ds Max兼容）"""
-        try:
-            # 确保输出目录存在
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            # 选择所有对象
-            bpy.ops.object.select_all(action='SELECT')
-            
-            # 检查是否有材质需要处理
-            has_materials = False
-            for obj in scene.objects:
-                if hasattr(obj, 'material_slots') and obj.material_slots:
-                    has_materials = True
-                    break
-            
-            log_manager.add('INFO', f"导出FBX到: {os.path.basename(output_path)}", source_path)
-            
-            # 导出设置 - 重点优化
-            bpy.ops.export_scene.fbx(
-                filepath=output_path,
-                use_selection=True,
-                
-                # 只导出必要的类型
-                object_types={'EMPTY', 'ARMATURE', 'MESH'},
-                
-                # 3ds Max兼容设置
-                global_scale=1.0,
-                apply_scale_options='FBX_SCALE_NONE',
-                axis_forward='-Z',
-                axis_up='Y',
-                
-                # 网格设置
-                mesh_smooth_type='EDGE',
-                use_mesh_modifiers=True,
-                use_subsurf=False,
-                
-                # 材质和纹理 - 确保嵌入纹理信息
-                bake_space_transform=False,
-                
-                # 材质处理
-                use_mesh_edges=False,
-                use_tspace=False,
-                
-                # 动画 - 不导出
-                bake_anim=False,
-                bake_anim_use_all_bones=False,
-                bake_anim_use_nla_strips=False,
-                bake_anim_use_all_actions=False,
-                
-                # 嵌入纹理 - 保留纹理路径信息但不嵌入文件
-                embed_textures=False,
-                path_mode='AUTO',
-                
-                # 其他优化
-                use_custom_props=False,
-                add_leaf_bones=False,
-                primary_bone_axis='Y',
-                secondary_bone_axis='X',
-                use_armature_deform_only=True,
-                armature_nodetype='NULL',
-            )
-            
-            return True
-            
-        except Exception as e:
-            log_manager.add('ERROR', f"导出失败: {str(e)[:100]}", source_path)
-            return False
-    
-    def get_output_path(self, input_path, rel_path):
-        """生成输出路径：同级目录/文件夹名_FBX_Exports/..."""
-        # 获取输入文件夹的名称
-        input_folder = os.path.basename(self.directory)
-        
-        # 构建输出基础路径
-        parent_dir = os.path.dirname(self.directory)
-        output_base = os.path.join(parent_dir, f"{input_folder}_FBX_Exports")
-        
-        # 如果有子文件夹结构，保持结构
-        if os.path.dirname(rel_path):
-            output_dir = os.path.join(output_base, os.path.dirname(rel_path))
-        else:
-            output_dir = output_base
-        
-        # 确保目录存在
-        os.makedirs(output_dir, exist_ok=True)
+    def _get_output_path(self, input_path, index):
+        """生成输出路径 - 修改：全部放在同一文件夹"""
+        # 构建输出目录（直接放在"导出FBX"文件夹，不创建子目录）
+        output_dir = os.path.join(self.directory, "导出FBX")
         
         # 生成输出文件名
         input_name = os.path.splitext(os.path.basename(input_path))[0]
         output_name = f"{input_name}.fbx"
         
+        # 如果文件名已存在，添加数字后缀避免覆盖
+        counter = 1
+        original_name = output_name
+        while os.path.exists(os.path.join(output_dir, output_name)):
+            base_name = os.path.splitext(original_name)[0]
+            ext = os.path.splitext(original_name)[1]
+            output_name = f"{base_name}_{counter}{ext}"
+            counter += 1
+            if counter > 100:  # 防止无限循环
+                break
+        
         return os.path.join(output_dir, output_name)
     
-    def clean_scene(self, scene):
-        """清理场景中的所有对象"""
-        # 解除所有对象的链接
-        for obj in list(scene.objects):
-            scene.collection.objects.unlink(obj)
-        
-        # 删除所有对象
-        for obj in list(bpy.data.objects):
-            if obj.users == 0:
-                bpy.data.objects.remove(obj)
-        
-        # 清理孤立的材质和纹理
-        for block in [bpy.data.materials, bpy.data.images, bpy.data.meshes, bpy.data.armatures]:
-            for item in block:
-                if item.users == 0:
-                    block.remove(item)
-        
-        # 强制释放内存
-        bpy.ops.wm.memory_statistics()
-    
-    def cleanup_temp_scene(self, temp_scene, original_scene):
-        """清理临时场景并恢复原场景"""
-        # 恢复到原场景
-        bpy.context.window.scene = original_scene
-        
-        # 清理临时场景
-        if temp_scene:
-            # 移除临时场景中的所有对象
-            self.clean_scene(temp_scene)
-            
-            # 删除临时场景
-            if temp_scene.name in bpy.data.scenes:
-                bpy.data.scenes.remove(temp_scene)
-        
-        # 强制垃圾回收
-        bpy.ops.wm.memory_statistics()
+    def _update_ui(self, context):
+        """更新UI"""
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except:
+            pass
     
     def invoke(self, context, event):
-        # 打开文件夹选择对话框
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
-class ZW_PT_batch_fbx_converter(Panel):
-    """批量FBX转换面板"""
-    bl_label = "批量FBX转换"
-    bl_idname = "ZW_PT_batch_fbx_converter"
+class ZW_OT_save_log_to_file(Operator):
+    """保存日志到文件并自动打开删除"""
+    bl_idname = "zw.save_log_to_file"
+    bl_label = "保存日志到文件"
+    bl_description = "将转换日志保存到输出文件夹的临时文件中并自动打开，3秒后删除"
+    
+    def execute(self, context):
+        try:
+            # 获取输出目录
+            if hasattr(context.scene, 'zw_export_folder') and context.scene.zw_export_folder:
+                output_dir = context.scene.zw_export_folder
+            else:
+                # 尝试从结果中获取输出路径
+                if context.scene.zw_conversion_results:
+                    for result in context.scene.zw_conversion_results:
+                        if result.output_path:
+                            output_dir = os.path.dirname(result.output_path)
+                            break
+                    else:
+                        self.report({'WARNING'}, "没有找到输出目录")
+                        return {'CANCELLED'}
+                else:
+                    self.report({'WARNING'}, "请先执行转换")
+                    return {'CANCELLED'}
+            
+            # 确保输出目录存在
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # 保存日志到文件并打开
+            success, message = log_manager.save_to_temp_file_and_open(output_dir)
+            
+            if success:
+                self.report({'INFO'}, message)
+            else:
+                self.report({'ERROR'}, message)
+                return {'CANCELLED'}
+            
+            return {'FINISHED'}
+            
+        except Exception as e:
+            log_manager.add('ERROR', f"保存日志失败: {str(e)}")
+            self.report({'ERROR'}, f"保存日志失败: {str(e)}")
+            return {'CANCELLED'}
+
+# ============================================================================
+# 6. UI 面板（版本一：带日志功能）
+# ============================================================================
+class ZW_PT_batch_converter_main(Panel):
+    """主面板 - 版本一：带日志功能"""
+    bl_label = "批量FBX转换器"
+    bl_idname = "ZW_PT_batch_converter_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "ZW_Blender"
@@ -461,157 +702,144 @@ class ZW_PT_batch_fbx_converter(Panel):
     def draw(self, context):
         layout = self.layout
         
-        # 说明
+        # 批量转换部分
         box = layout.box()
-        box.label(text="使用方法:", icon='INFO')
-        box.label(text="1. 点击下方按钮选择文件夹")
-        box.label(text="2. 自动处理所有子文件夹中的模型文件")
-        box.label(text="3. 输出到: 同级目录/文件夹名_FBX_Exports")
-        
-        # 主要按钮
-        layout.separator()
-        row = layout.row()
-        row.scale_y = 2.0
-        op = row.operator("zw.batch_fbx_converter", 
-                         text="选择文件夹并批量转换", 
-                         icon='EXPORT')
-        
-        # 支持的格式
-        layout.separator()
-        box = layout.box()
-        box.label(text="支持的格式:", icon='FILE_3D')
-        
-        # 显示支持的格式
-        formats_row = box.row()
-        col1 = formats_row.column()
-        col2 = formats_row.column()
-        
-        formats = ['.obj', '.fbx', '.blend', '.gltf', '.glb', '.dae', '.3ds', '.ply', '.stl']
-        for i, fmt in enumerate(formats):
-            if i % 2 == 0:
-                col1.label(text=f"• {fmt}")
-            else:
-                col2.label(text=f"• {fmt}")
-        
-        # 3ds Max兼容说明
-        layout.separator()
-        box = layout.box()
-        box.label(text="3ds Max兼容设置:", icon='IMPORT')
+        box.label(text="FBX批量转换", icon='EXPORT')
         
         col = box.column(align=True)
-        col.label(text="• 轴向: Y向上，-Z向前")
-        col.label(text="• 单位: 米制")
-        col.label(text="• 平滑: 边缘平滑组")
-        col.label(text="• 材质: 保留贴图路径")
+        col.scale_y = 2.0
+        col.operator("zw.batch_fbx_converter", text="转FBX（文件夹）", icon='FILE_FOLDER')
+
+        row = box.row(align=True)
+        row.scale_y = 1
+        row.operator("zw.save_log_to_file", text="打印日志", icon='TEXT')
+                
+        # 最近日志（可折叠）
+        box = layout.box()
+        row = box.row()
         
-        # 处理日志
-        if log_manager.logs:
-            layout.separator()
-            box = layout.box()
-            box.label(text="处理日志:", icon='TEXT')
+        # 可折叠控制
+        show_logs = getattr(context.scene, 'zw_show_recent_logs', True)
+        row.prop(context.scene, 'zw_show_recent_logs', 
+                text="最近日志", 
+                icon='TRIA_DOWN' if show_logs else 'TRIA_RIGHT',
+                emboss=False)
+        
+        if show_logs:
+            logs = log_manager.get_recent(10)
             
-            summary = log_manager.get_summary()
-            row = box.row()
-            row.label(text=f"总计: {summary['total']}", icon='LINENUMBERS_ON')
-            row.label(text=f"成功: {summary['success']}", icon='CHECKMARK')
-            row.label(text=f"失败: {summary['errors']}", icon='X')
-            row.label(text=f"耗时: {summary['elapsed']}", icon='TIME')
-            
-            # 显示最近的日志（最多10条）
-            box.separator()
-            recent_logs = log_manager.logs[-10:]  # 只显示最近10条
-            
-            for log_entry in recent_logs:
-                row = box.row(align=True)
-                
-                # 时间
-                row.label(text=log_entry['time'], icon='TIME')
-                
-                # 图标
-                if log_entry['level'] == 'SUCCESS':
-                    row.label(text="", icon='CHECKMARK')
-                elif log_entry['level'] == 'ERROR':
-                    row.label(text="", icon='X')
-                elif log_entry['level'] == 'WARNING':
-                    row.label(text="", icon='ERROR')
-                else:
-                    row.label(text="", icon='INFO')
-                
-                # 消息（截断过长的消息）
-                message = log_entry['message']
-                if len(message) > 40:
-                    message = message[:37] + "..."
-                row.label(text=message)
-            
-            # 显示详细错误
-            error_logs = [l for l in log_manager.logs if l['level'] == 'ERROR']
-            if error_logs and len(error_logs) > 0:
-                box.separator()
-                box.label(text="详细错误:", icon='ERROR')
-                
-                # 只显示前5个错误
-                for i, log_entry in enumerate(error_logs[:5]):
+            if not logs:
+                box.label(text="暂无日志", icon='INFO')
+            else:
+                for log_entry in logs:
                     row = box.row(align=True)
-                    filename = os.path.basename(log_entry['filepath']) if log_entry['filepath'] else "未知"
-                    row.label(text=f"{filename}: {log_entry['message']}")
-            
-            # 清除日志按钮
-            box.separator()
-            row = box.row()
-            row.operator("zw.clear_logs", text="清除日志", icon='TRASH')
+                    row.scale_y = 0.8
+                    
+                    # 根据日志级别显示不同图标
+                    icon = 'INFO'
+                    if log_entry['level'] == 'SUCCESS':
+                        icon = 'CHECKMARK'
+                    elif log_entry['level'] == 'ERROR':
+                        icon = 'ERROR'
+                    elif log_entry['level'] == 'WARNING':
+                        icon = 'ERROR'
+                    
+                    row.label(text="", icon=icon)
+                    
+                    # 显示日志内容
+                    if log_entry['filepath']:
+                        filename = os.path.basename(log_entry['filepath'])
+                        # 缩短显示，避免过长
+                        display_msg = log_entry['message']
+                        if len(display_msg) > 40:
+                            display_msg = display_msg[:37] + "..."
+                        row.label(text=f"{filename}: {display_msg}")
+                    else:
+                        msg = log_entry['message']
+                        if len(msg) > 50:
+                            msg = msg[:47] + "..."
+                        row.label(text=msg)
 
-class ZW_OT_clear_logs(Operator):
-    """清除日志"""
-    bl_idname = "zw.clear_logs"
-    bl_label = "清除日志"
-    
-    def execute(self, context):
-        log_manager.clear()
-        context.scene.zw_conversion_results.clear()
-        self.report({'INFO'}, "日志已清除")
-        return {'FINISHED'}
-
-# 定义所有要注册的类
+# ============================================================================
+# 7. 注册和初始化
+# ============================================================================
 classes = (
     ZW_ConversionResult,
     ZW_OT_batch_fbx_converter,
-    ZW_OT_clear_logs,
-    ZW_PT_batch_fbx_converter,
+    ZW_OT_save_log_to_file,
+    ZW_PT_batch_converter_main,
 )
 
 def register():
+    """注册插件"""
     # 注册类
     for cls in classes:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as e:
+            print(f"注册类 {cls.__name__} 时出错: {e}")
     
-    # 注册场景属性
+    # 注册属性
     bpy.types.Scene.zw_conversion_results = CollectionProperty(type=ZW_ConversionResult)
+    bpy.types.Scene.zw_show_recent_logs = BoolProperty(
+        name="显示最近日志",
+        default=True,
+        description="展开或折叠最近日志显示"
+    )
+    bpy.types.Scene.zw_export_folder = StringProperty(
+        name="导出文件夹",
+        default="",
+        description="最近导出的FBX文件所在文件夹"
+    )
     
-    print("=" * 70)
-    print("✅ ZW_Blender - 批量FBX转换器 (优化版) 安装成功！")
-    print("=" * 70)
-    print("📁 功能特点:")
-    print("  • 只处理文件夹，递归搜索所有子文件夹")
-    print("  • 输出到: 同级目录/文件夹名_FBX_Exports")
-    print("  • 3ds Max兼容: Y向上，-Z向前")
-    print("  • 内存优化: 每个文件处理完后清理场景")
-    print("  • 详细日志: 实时显示处理进度和错误")
-    print("  • 性能优化: 适合批量处理上百个文件")
-    print("=" * 70)
-    print("📁 位置: 3D视图右侧面板 > ZW_Blender选项卡")
-    print("=" * 70)
+    # 设置日志回调
+    def update_logs():
+        try:
+            for area in bpy.context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except:
+            pass
+    
+    log_manager.callback = update_logs
+    
+    # 注册退出时的清理函数
+    atexit.register(lambda: log_manager._delete_temp_file())
+    
+    print("=" * 60)
+    print("✅ ZW_Blender - 批量FBX转换器 v2.2.1 版本一")
+    print("📋 版本特点:")
+    print("  • 支持保存日志到输出文件夹")
+    print("  • 自动打开日志文件并3秒后删除")
+    print("  • 保留完整的日志显示功能")
+    print("📁 使用方法:")
+    print("  1. 点击'选择文件夹并转换'开始转换")
+    print("  2. 转换完成后点击'保存日志到文件'")
+    print("  3. 日志会自动打开并在3秒后删除")
+    print("=" * 60)
 
 def unregister():
-    # 删除场景属性
-    if hasattr(bpy.types.Scene, 'zw_conversion_results'):
-        del bpy.types.Scene.zw_conversion_results
+    """注销插件"""
+    # 清理临时文件
+    try:
+        log_manager._delete_temp_file()
+    except:
+        pass
+    
+    # 清理属性
+    for prop_name in ['zw_conversion_results', 'zw_show_recent_logs', 'zw_export_folder']:
+        if hasattr(bpy.types.Scene, prop_name):
+            delattr(bpy.types.Scene, prop_name)
     
     # 注销类
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except:
+            pass
     
-    print("ZW_Blender - 批量FBX转换器插件已卸载")
+    print("ZW_Blender - 批量FBX转换器版本一已卸载")
 
-# 这允许脚本直接在文本编辑器中运行
+# 脚本直接运行
 if __name__ == "__main__":
     register()
