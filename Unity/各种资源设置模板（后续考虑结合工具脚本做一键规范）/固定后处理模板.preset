@@ -1,0 +1,43 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!181963792 &2655988077585873504
+Preset:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: "\u56FA\u5B9A\u540E\u5904\u7406\u6A21\u677F"
+  m_TargetType:
+    m_NativeTypeID: 114
+    m_ManagedTypePPtr: {fileID: 11500000, guid: d7fd9488000d3734a9e00ee676215985, type: 3}
+    m_ManagedTypeFallback: 
+  m_Properties:
+  - target: {fileID: 0}
+    propertyPath: m_Enabled
+    value: 1
+    objectReference: {fileID: 0}
+  - target: {fileID: 0}
+    propertyPath: m_EditorHideFlags
+    value: 0
+    objectReference: {fileID: 0}
+  - target: {fileID: 0}
+    propertyPath: m_EditorClassIdentifier
+    value: 
+    objectReference: {fileID: 0}
+  - target: {fileID: 0}
+    propertyPath: components.Array.size
+    value: 3
+    objectReference: {fileID: 0}
+  - target: {fileID: 0}
+    propertyPath: components.Array.data[0]
+    value: 
+    objectReference: {fileID: 5474591915237269044, guid: 574ef4d3973e10148b4f130a93cd2f85, type: 2}
+  - target: {fileID: 0}
+    propertyPath: components.Array.data[1]
+    value: 
+    objectReference: {fileID: 1454950747085462575, guid: 574ef4d3973e10148b4f130a93cd2f85, type: 2}
+  - target: {fileID: 0}
+    propertyPath: components.Array.data[2]
+    value: 
+    objectReference: {fileID: -8314749049673159295, guid: 574ef4d3973e10148b4f130a93cd2f85, type: 2}
+  m_ExcludedProperties: []

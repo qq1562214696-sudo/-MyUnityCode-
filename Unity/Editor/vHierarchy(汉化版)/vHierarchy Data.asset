@@ -1,0 +1,65 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: dbf6d84fd806ca24ba77a3fca05a2d3f, type: 3}
+  m_Name: vHierarchy Data
+  m_EditorClassIdentifier: 
+  sceneDatas_byGuid:
+    keys:
+    - 4a181bef5b9c6264aa5f46779fb3a453
+    - ecd0c5042602cb84eb7a8b5f75d23b6a
+    - b4ac9b5b69e26554098eb63dc2908b88
+    values:
+    - goDatas_byGlobalId:
+        keys:
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-432432459-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-1257360073-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-1733962075-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-2113103336-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-326640093-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-565179619-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-853658429-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-1837419813-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-133978472-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-282143957-0
+        - globalObjectIdString: GlobalObjectId_V1-2-4a181bef5b9c6264aa5f46779fb3a453-1397182718-0
+        values:
+        - colorIndex: 0
+          iconNameOrGuid: Settings Icon
+        - colorIndex: 7
+          iconNameOrGuid: Favorite
+        - colorIndex: 0
+          iconNameOrGuid: Light Icon
+        - colorIndex: 0
+          iconNameOrGuid: DirectionalLight Icon
+        - colorIndex: 0
+          iconNameOrGuid: AudioSource Icon
+        - colorIndex: 0
+          iconNameOrGuid: PreMatCylinder
+        - colorIndex: 0
+          iconNameOrGuid: PreMatQuad
+        - colorIndex: 0
+          iconNameOrGuid: PreMatCube
+        - colorIndex: 2
+          iconNameOrGuid: Favorite
+        - colorIndex: 3
+          iconNameOrGuid: Favorite
+        - colorIndex: 0
+          iconNameOrGuid: Settings Icon
+    - goDatas_byGlobalId:
+        keys: []
+        values: []
+    - goDatas_byGlobalId:
+        keys:
+        - globalObjectIdString: GlobalObjectId_V1-2-b4ac9b5b69e26554098eb63dc2908b88-328884895-0
+        values:
+        - colorIndex: 0
+          iconNameOrGuid: Camera Icon

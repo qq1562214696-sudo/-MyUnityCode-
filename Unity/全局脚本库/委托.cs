@@ -1,0 +1,1 @@
+public delegate void 红外线事件委托();
